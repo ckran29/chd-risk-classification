@@ -1,0 +1,620 @@
+---
+title: "BUS 4440_CDC"
+author: "C. Krance"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include=TRUE, 
+                      echo = FALSE, 
+                      warning = FALSE, 
+                      message = FALSE, 
+                      comment = " ", 
+                      eval = TRUE)
+```
+
+Coronary heart disease (CHD) is the leading cause of death in the United States, 
+accounting for approximately 375,000 deaths annually. Despite its prevalence, CHD 
+remains significantly underdiagnosed, particularly among populations with limited 
+healthcare access, creating opportunities for data-driven screening tools that can 
+identify high-risk individuals before a clinical event occurs. Early and accurate 
+classification of CHD risk has direct applications in preventive care, patient 
+stratification for clinical trial enrollment, and targeted pharmaceutical intervention.
+
+This project uses data from the 2024 Behavioral Risk Factor Surveillance System 
+(BRFSS), an annual CDC telephone survey collecting health-related behavioral and 
+chronic condition data from over 400,000 U.S. adults. The BRFSS is one of the 
+largest continuously conducted health surveys in the world and serves as a primary 
+data source for population-level disease surveillance. Variables were selected to 
+capture three domains known to be associated with CHD risk: lifestyle behaviors 
+(smoking, physical activity, alcohol consumption), chronic condition history 
+(diabetes, stroke), and demographic characteristics (age, sex, race, BMI, income, 
+education).
+
+Three classification models (decision tree, logistic regression, and XGBoost) were 
+trained and evaluated on a downsampled, balanced dataset to address the natural 
+class imbalance in CHD prevalence. LASSO regularization was applied for variable 
+selection prior to model training. Models were evaluated on a held-out validation 
+set using sensitivity, specificity, and AUC as primary performance metrics, with 
+sensitivity prioritized given the clinical cost asymmetry between false negatives 
+and false positives in a medical screening context.
+
+
+### Hypothesis
+This project examines whether demographic, lifestyle, and chronic condition variables from the 2024 BRFSS can accurately classify coronary heart disease status. I hypothesize that logistic regression and ensemble models trained on these variables will achieve AUC above 0.80, with age, stroke history, and self-reported general health emerging as the strongest predictors.
+
+
+
+```{r}
+library(haven)
+library(tidyverse)
+library(dplyr)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(glmnet) #lasso
+library(ggplot2)
+library(pROC)
+library(xgboost)
+library(Ckmeans.1d.dp)
+library(doParallel)
+
+```
+
+```{r}
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+```
+
+
+```{r}
+df_raw <- read_xpt("LLCP2024.XPT")%>% 
+  dplyr::select(
+    `_MICHD`,     # outcome — reported having CHD or MI
+    `_SEX`,       # biological sex
+    `_AGEG5YR`,   # age categories
+    `_RACE`,      # race categories
+    `_BMI5CAT`,   # BMI categories
+    `_EDUCAG`,    # education categories
+    `_INCOMG1`,   # income brackets
+    SMOKE100,     # smoked 100 cigs in lifetime
+    CVDSTRK3,     # ever had a stroke
+    DIABETE4,     # diabetes (Yes/No)
+    GENHLTH,      # self assessed general health categories
+    MEDCOST1,     # can't see doctor due to cost
+    CHECKUP1,     # time since last routine checkup
+    `_TOTINDA`,   # physical activity last 30 days
+    AVEDRNK4,     # avg drinks over last 30 days
+    `_HLTHPL2`,   # health insurance coverage
+    MENTHLTH      # mental health bad days
+  )
+
+```
+
+
+
+```{r}
+df_clean <- df_raw %>% 
+  mutate(
+    MICHD = case_when(
+                        `_MICHD` == 2 ~ 0,
+                        `_MICHD` == 1 ~ 1,
+                        TRUE ~ NA_real_
+    ),
+      SEX = factor(`_SEX`,
+                      levels = 1:2,
+                      labels = c("Male", "Female")
+       
+    ),
+      AGEG5YR = factor(`_AGEG5YR`,
+                          levels = 1:13,
+                          labels = c("18_24", "25_29", "30_34", "35_39", "40_44",
+                                     "45_49", "50_54", "55_59", "60_64", "65_69",
+                                     "70_74", "75_79", ">80")
+    ),
+      RACE = factor(`_RACE`,
+                       levels = 1:8,
+                       labels = c("White", "Black", "American Indian/Alaskan Native", 
+                                  "Asian", "Native Hawaiian_Pacific Islander", 
+                                  "Other", "Multiracial", "Hispanic")
+    ),
+      EDUCAG = factor(`_EDUCAG`,
+                         levels = 1:4,
+                         labels = c("DNF_High_School","High_School_Grad",
+                                    "Attended_College","College_Grad")
+                         
+    ),
+        BMI5CAT = factor(`_BMI5CAT`,
+                            levels = 1:4,
+                            labels = c("Underweight", "Normal", 
+                                       "Overweight", "Obese")
+    
+    ),
+      INCOMG1 = case_when(
+                            `_INCOMG1` == 9 ~ NA_real_,
+                            TRUE ~ `_INCOMG1`
+    ),
+      SMOKE100 = case_when(
+                          SMOKE100 == 1 ~ 1,
+                          SMOKE100 == 2 ~ 0,
+                          TRUE ~ NA_real_
+                      
+    ),
+      CVDSTRK3 = case_when(
+                          CVDSTRK3 == 1 ~ 1,
+                          CVDSTRK3 == 2 ~ 0,
+                          TRUE ~ NA_real_
+        
+    ),
+      DIABETE4 = case_when(
+                          DIABETE4 == 1 ~ 1,
+                          DIABETE4 %in% 2:4 ~ 0,
+                          TRUE ~ NA_real_
+        
+    ),
+      GENHLTH = factor(GENHLTH,
+                      levels = 1:5,
+                      labels = c("Excellent", "Very Good", "Good", "Fair", "Poor")
+                      
+    ),
+      MEDCOST1 = case_when(
+                          MEDCOST1 == 1 ~ 1,
+                          MEDCOST1 == 2 ~ 0,
+                          TRUE ~ NA_real_
+        
+    ),
+      CHECKUP1 = factor(CHECKUP1,
+                        levels = c(1,2,3,4,8),
+                        labels = c("<1_year","1_2_years","2_5_years",">5_years","Never")
+        
+    ),
+      TOTINDA = case_when(
+                            `_TOTINDA` == 1 ~ 1,
+                            `_TOTINDA` == 2 ~ 0,
+                            TRUE ~ NA_real_
+        
+    ),
+      AVEDRNK4 = case_when(
+                          AVEDRNK4 == 88 ~ 0,      ## coded as none
+                          AVEDRNK4 %in% 1:76 ~ AVEDRNK4,
+                          TRUE ~ NA_real_ 
+                        
+    ),
+      HLTHPL2 = case_when(
+                            `_HLTHPL2` == 1 ~ 1,
+                            `_HLTHPL2` == 2 ~ 0,
+                            TRUE~ NA_real_
+        
+    ),
+      MENTHLTH = case_when(
+                          MENTHLTH == 88 ~ 0,
+                          MENTHLTH %in% 1:30 ~ MENTHLTH,
+                          TRUE ~ NA_real_
+      ),
+  ) %>%
+  dplyr::select(MICHD, everything(), -`_MICHD`, -`_SEX`, -`_AGEG5YR`, -`_RACE`, 
+         -`_EDUCAG`, -`_BMI5CAT`, -`_INCOMG1`, 
+         -`_TOTINDA`, -`_HLTHPL2`)
+  
+```
+
+
+
+```{r}
+df_clean <- df_clean %>%
+  drop_na()
+```
+
+
+
+```{r}
+set.seed(123)
+df_clean_down <- downSample(
+  x = df_clean %>% dplyr::select(-MICHD),     ## Addresses huge class imbalance
+  y = as.factor(df_clean$MICHD),
+  yname = "MICHD"
+)
+```
+
+
+```{r}
+set.seed(123)
+
+idx <- createDataPartition(df_clean_down$MICHD, p = 0.6, list = FALSE)
+train.df <- df_clean_down[idx,]
+holdout.df <- df_clean_down[-idx,]
+```
+
+
+
+```{r}
+
+# 1. Separate features and target
+x_train <- train.df[, !names(train.df) %in% "MICHD"]
+x_test  <- holdout.df[, !names(holdout.df) %in% "MICHD"]
+y_train <- train.df$MICHD
+y_test  <- holdout.df$MICHD
+
+# 2. Dummy encode using model.matrix
+x_train_matrix <- model.matrix(~ . - 1, data = x_train)
+x_test_matrix  <- model.matrix(~ . - 1, data = x_test)
+
+# 3. Fit Lasso
+cv_lasso <- cv.glmnet(x_train_matrix, y_train, alpha = 1, family = "binomial", nfolds = 5)
+
+# 4. Predict on holdout
+predictions <- predict(cv_lasso, newx = x_test_matrix, s = "lambda.min", type = "class")
+```
+
+
+
+```{r, results='hide'} 
+
+
+# 1. Confusion matrix
+confusionMatrix(as.factor(predictions), as.factor(y_test))
+
+# 2. Quick accuracy
+mean(predictions == y_test)
+
+# 3. See which variables Lasso kept (non-zero coefficients)
+coef(cv_lasso, s = "lambda.min")
+
+# 4. Plot CV error vs lambda
+plot(cv_lasso)
+
+
+
+```
+
+
+
+```{r, results='hide'}
+lasso_coefs <- coef(cv_lasso, s = "lambda.min")
+lasso_df <- data.frame(
+  variable = rownames(lasso_coefs),
+  coefficient = as.numeric(lasso_coefs)
+)
+
+# Sort by absolute value to see most important variables
+lasso_df <- lasso_df[order(abs(lasso_df$coefficient), decreasing = TRUE), ]
+lasso_df <- lasso_df[lasso_df$coefficient != 0, ]  # drop zeroes
+print(lasso_df)
+```
+
+Variables with the largest absolute effect were kept in the final dataset. 9 Explanatory variables performed nearly identically to all 16 variables.
+
+
+```{r}
+df_final <- df_clean_down %>% 
+          dplyr::select(MICHD, AGEG5YR, CVDSTRK3, GENHLTH, SEX, CHECKUP1, RACE, DIABETE4, MEDCOST1, SMOKE100)
+```
+
+
+```{r}
+set.seed(123)
+
+idx <- createDataPartition(df_final$MICHD, p = 0.6, list = FALSE)
+train.df <- df_final[idx,]
+holdout.df <- df_final[-idx,]
+```
+
+
+```{r}
+tree_model_1 <- rpart(MICHD ~ .,
+                      data = train.df,
+                      method = "class",
+                      parms = list(prior = c(0.5, 0.5)),
+                      control = rpart.control(
+                        maxdepth = 10,    
+                        minsplit = 20,    # min observations to attempt a split
+                        cp = 0.001        # lower = more splits, more complex tree
+                      ))
+g = rpart.plot(tree_model_1, extra = 1, fallen.leaves = FALSE)
+```
+
+
+```{r, results='hide'}
+png("decision_tree.png", width = 4000, height = 2500, res = 200)
+rpart.plot(tree_model_1, 
+           extra = 1, 
+           fallen.leaves = FALSE,
+           tweak = 1.2)
+dev.off()
+```
+
+
+
+```{r, results='hide'}
+tree.pred <- predict(tree_model_1, holdout.df, type = "class")
+confusionMatrix(tree.pred, as.factor(holdout.df$MICHD), 
+                positive = "1")
+```
+### Decision Tree
+
+The tree visualizes that age and self-rated general health are the two strongest 
+predictors of CHD, followed by stroke history and sex. The highest-risk profile 
+is an older adult (55+, more prevalent in men) who rates their health as Fair or 
+Poor and has a prior stroke history.
+
+| Metric       | Value  |
+|--------------|--------|
+| Accuracy     | 75.66% |
+| Sensitivity  | 81.34% |
+| Specificity  | 69.98% |
+| PPV          | 73.04% |
+| NPV          | 78.95% |
+| AUC          | 0.810  |
+
+The model achieves the highest sensitivity of the three models, correctly identifying 
+81.34% of true CHD cases. McNemar's test (p < 2.2e-16) confirms significantly more 
+false positives than false negatives (1,385 vs. 861) — a clinically acceptable 
+asymmetry, as over-flagging CHD risk is preferable to missing true cases. Performance 
+is significantly better than random guessing (p < 2.2e-16).
+  
+
+```{r, results='hide'}
+train.df$MICHD <- as.factor(train.df$MICHD)
+holdout.df$MICHD <- as.factor(holdout.df$MICHD)
+
+trControl <- caret::trainControl(method = "cv", number = 5, allowParallel = TRUE)
+logit.reg <- caret::train(MICHD ~ ., data = train.df, trControl = trControl, 
+                          method = "glm", family = "binomial")
+
+logit.reg
+summary(logit.reg$finalModel)
+```
+
+
+
+```{r, results='hide'}
+logit.pred <- predict(logit.reg, holdout.df)
+confusionMatrix(logit.pred, as.factor(holdout.df$MICHD), positive = "1")
+```
+
+### Logistic Regression
+
+Age is the strongest predictor of CHD. Coefficients become positive and statistically 
+significant beginning at ages 40–44 and increase monotonically through the 80+ group 
+(β = 3.27, p < 0.001). Younger age groups were not statistically significant. 
+Self-reported general health shows a strong dose-response pattern — Fair (β = 1.81) 
+and Poor (β = 2.21) health carry the largest effects, though even "Very Good" and 
+"Good" categories are positive and significant, suggesting CHD risk increases 
+continuously as health declines.
+
+Stroke history (β = 1.36, p < 0.001) is among the largest individual predictors, 
+consistent with shared vascular pathology. Female sex (β = −0.82, p < 0.001) and 
+Asian race (β = −0.72, p < 0.001) are negatively associated with CHD; most other 
+race categories were not statistically significant. Time since last checkup shows an 
+inverse relationship — individuals with checkups 2+ years ago have lower observed CHD 
+odds (β = −0.70 for 5+ years, p < 0.001), though this likely reflects behavioral 
+selection rather than a causal effect. Diabetes, cost barriers to care, and smoking 
+are each positive and significant (p < 0.001).
+
+| Metric       | Value  |
+|--------------|--------|
+| Accuracy     | 76.11% |
+| Sensitivity  | 78.11% |
+| Specificity  | 74.10% |
+| PPV          | 75.10% |
+| NPV          | 77.20% |
+| AUC          | 0.839  |
+
+Five-fold cross-validation produced a consistent accuracy of 76.42%, indicating the 
+model generalizes well and is not overfit. McNemar's test (p < 0.001) confirms 
+significantly more false positives than false negatives (1,195 vs. 1,010) — a 
+clinically acceptable asymmetry for a screening application. Performance is 
+significantly better than random guessing (p < 2.2e-16).
+
+
+
+### XGBoost
+
+```{r, results='hide'}
+
+# Encode for XGBoost
+x_train_xgb <- model.matrix(MICHD ~ . - 1, data = train.df)
+x_hold_xgb  <- model.matrix(MICHD ~ . - 1, data = holdout.df)
+y_train_xgb <- as.numeric(as.character(train.df$MICHD))
+y_hold_xgb  <- as.numeric(as.character(holdout.df$MICHD))
+
+dtrain <- xgb.DMatrix(data = x_train_xgb, label = y_train_xgb)
+dhold  <- xgb.DMatrix(data = x_hold_xgb,  label = y_hold_xgb)
+
+# Train — early stopping prevents overfitting and saves time
+set.seed(123)
+xgb_model <- xgb.train(
+  params = list(
+    objective        = "binary:logistic",
+    eval_metric      = "auc",
+    max_depth        = 6,
+    eta              = 0.05,
+    subsample        = 0.8,
+    colsample_bytree = 0.8,
+    nthread          = parallel::detectCores() - 1
+  ),
+  data              = dtrain,
+  nrounds           = 500,
+  watchlist         = list(train = dtrain, eval = dhold),
+  early_stopping_rounds = 20,   # stops if AUC doesn't improve for 20 rounds
+  verbose           = 0
+)
+
+# Predict
+xgb_prob  <- predict(xgb_model, dhold)
+xgb_class <- as.factor(ifelse(xgb_prob > 0.5, 1, 0))
+
+confusionMatrix(xgb_class, as.factor(holdout.df$MICHD), positive = "1")
+```
+
+```{r}
+# Variable importance plot
+xgb_imp <- xgb.importance(model = xgb_model)
+xgb.ggplot.importance(xgb_imp, top_n = 15) +
+  labs(title = "XGBoost Feature Importance") +
+  theme_minimal(base_size = 12)
+```
+
+The XGBoost feature importance plot confirms the patterns identified by logistic 
+regression and LASSO: the 80+ age group is the single most important feature, 
+followed by diabetes, stroke history, and older age brackets. Female sex, declining 
+general health, and smoking round out the top predictors. The close alignment between 
+XGBoost and logistic regression variable importance provides independent validation 
+that these relationships are robust and not model-specific artifacts.
+
+| Metric       | Value  |
+|--------------|--------|
+| Accuracy     | 75.88% |
+| Sensitivity  | 78.93% |
+| Specificity  | 72.82% |
+| PPV          | 74.39% |
+| NPV          | 77.56% |
+| AUC          | 0.838  |
+
+The model was trained with early stopping (20 rounds) and regularization via 
+subsampling and column sampling to prevent overfitting. McNemar's test 
+(p < 2.587e-09) confirms significantly more false positives than false negatives 
+(1,254 vs. 972) — consistent with the other models and clinically acceptable for 
+a screening context. The marginal performance gap between XGBoost and logistic 
+regression (ΔAUC = 0.001) suggests the underlying predictor relationships in this 
+dataset are largely linear and well-captured by the simpler model. Performance is 
+significantly better than random guessing (p < 2.2e-16).
+
+
+
+```{r}
+# Decision tree
+tree_prob <- predict(tree_model_1, holdout.df, type = "prob")[, "1"]
+
+# Logistic regression
+logit_prob <- predict(logit.reg, holdout.df, type = "prob")[, "1"]
+
+
+# Build ROC objects
+roc_tree  <- roc(as.numeric(as.character(holdout.df$MICHD)), tree_prob,  quiet = TRUE)
+roc_logit <- roc(as.numeric(as.character(holdout.df$MICHD)), logit_prob, quiet = TRUE)
+roc_xgb   <- roc(as.numeric(as.character(holdout.df$MICHD)), xgb_prob,   quiet = TRUE)
+```
+
+```{r,`include=TRUE`}
+# Agregated Chart
+ggroc(list(
+  "Decision Tree"       = roc_tree,
+  "Logistic Regression" = roc_logit,
+  "XGBoost"             = roc_xgb
+), linewidth = 0.8) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c("#E63946", "#457B9D", "#2A9D8F")) +
+  labs(
+    title = "ROC Curves — CHD Classification Models",
+    x = "Specificity", y = "Sensitivity", color = "Model"
+  ) +
+ annotate("text", x = 0.75, y = 0.05,
+         label = paste0("AUC:  Tree: ",     sprintf("%.3f", auc(roc_tree)),
+                        "   |   Logit: ",   sprintf("%.3f", auc(roc_logit)),
+                        "   |   XGBoost: ", sprintf("%.3f", auc(roc_xgb))),
+         size = 3.2, hjust = 0)
+```
+
+
+```{r}
+model_comparison <- data.frame(
+  Model          = c("Decision Tree", "Logistic Regression", "XGBoost"),
+  Accuracy       = c(0.7566, 0.7611, 0.7588),
+  Sensitivity    = c(0.8134, 0.7811, 0.7893),
+  Specificity    = c(0.6998, 0.7410, 0.7282),
+  Pos_Pred_Value = c(0.7304, 0.7510, 0.7439),
+  Neg_Pred_Value = c(0.7895, 0.7720, 0.7756),
+  Kappa          = c(0.5132, 0.5221, 0.5176),
+  AUC            = c(0.810,  0.839,  0.838)
+)
+knitr::kable(model_comparison, caption = "Model Performance Comparison")
+```
+
+
+
+
+The ROC curves confirm that logistic regression is the best-performing model, achieving the 
+highest AUC of 0.839, followed closely by XGBoost (0.838) and the decision tree (0.810). 
+AUC evaluates model performance across all possible classification thresholds simultaneously, 
+making it a more reliable basis for model comparison than single-threshold metrics like 
+sensitivity or accuracy alone.
+
+While the decision tree achieved the highest sensitivity (81.34%) at the default 0.50 
+threshold, the ROC curve reveals this was partly an artifact of that threshold rather than 
+superior overall discrimination. At any fixed operating point on the curve, logistic 
+regression outperforms the decision tree while generating fewer false alarms.
+
+Logistic regression was selected as the final model. It achieves the highest AUC, produces 
+fully interpretable coefficients that map directly to known clinical risk factors, and 
+matches XGBoost performance without the added complexity — confirming that on structured 
+survey data of this type, a well-specified logistic regression is competitive with ensemble 
+methods. All three models substantially outperform the no-information baseline (AUC = 0.50), 
+and results are consistent with published CHD risk models such as the Framingham Heart Score, 
+which achieves AUC in the 0.75–0.85 range on comparable population-level data.
+
+
+
+```{r}
+# Refit final model on full downsampled dataset for deployment
+set.seed(123)
+final_logit <- caret::train(MICHD ~ ., 
+                            data = df_final, 
+                            method = "glm", 
+                            family = "binomial",
+                            trControl = trainControl(method = "cv", 
+                                                     number = 5, 
+                                                     allowParallel = TRUE))
+```
+
+```{r}
+# End parallel processing
+stopCluster(cl)
+```
+
+The final logistic regression model was refit on the full downsampled dataset for deployment; 
+holdout performance metrics reported above remain the authoritative evaluation.
+
+
+### Limitations
+
+Several limitations should be considered when interpreting these results. 
+First, the BRFSS relies entirely on self-reported data, which introduces 
+recall bias and potential misclassification. Respondents may inaccurately 
+report diagnoses, behaviors, or health status. Second, the survey is 
+cross-sectional, meaning all variables are measured at a single point in 
+time. This prevents any causal inference; observed associations reflect 
+correlation rather than directionality or mechanism.
+
+Third, and most importantly for clinical applicability, the models are 
+constrained to variables available through public health surveys. 
+Established clinical biomarkers with strong predictive value for CHD, 
+including LDL and HDL cholesterol, C-reactive protein, troponin levels, 
+coronary artery calcium scores, and blood pressure readings, are absent 
+from the BRFSS by design. The inclusion of even a small number of these 
+biomarkers would likely improve AUC substantially and bring the model 
+closer to the performance of validated clinical risk tools such as the 
+Pooled Cohort Equations or HEART score. The current models should 
+therefore be interpreted as population-level screening tools rather than 
+clinical diagnostic instruments.
+
+Finally, downsampling was used to address class imbalance, which 
+improves model balance but reduces the effective training sample and may 
+not reflect the true population prevalence of CHD.
+
+
+### Acknowledgements
+
+I would like to personally thank Dr. Shankar Ghimire at Florida Southern College for 
+providing this opportunity as part of the BUS 4440 Data Mining course.
+
+
+
+
+
+
+
+
+
