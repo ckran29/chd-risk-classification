@@ -3,7 +3,7 @@
 
 Predicting coronary heart disease (CHD) status in U.S. adults using 
 demographic, lifestyle, and chronic condition variables from the 2024 
-CDC Behavioral Risk Factor Surveillance System (BRFSS).
+CDC Behavioral Risk Factor Surveillance System (BRFSS) in R.
 
 ## Overview
 
